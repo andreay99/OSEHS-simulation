@@ -13,9 +13,9 @@ from sim.orbital import AU
 # -----------------------------------------------------------------------
 # Replace these with real values from KesUraNu's orbital dynamics analysis.
 
-ORBITAL_RADIUS = 1.0 * AU       # semimajor axis (m) — 1 AU for heliocentric orbit
-ECCENTRICITY = 0.0              # eccentricity — 0 = circular orbit
-INCLINATION = np.radians(5)     # inclination (radians) — 5° placeholder
+ORBITAL_RADIUS = 0.6722 * AU    # semimajor axis (m) — from KesUraNu's mission profile
+ECCENTRICITY = 0.0760           # eccentricity — from KesUraNu's mission profile
+INCLINATION = np.radians(5)     # inclination (radians) — placeholder (not provided)
 ARGUMENT_OF_PERIGEE = 0.0       # argument of perigee (rad)
 
 # -----------------------------------------------------------------------
