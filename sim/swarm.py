@@ -1,6 +1,7 @@
 import numpy as np
 from sim.unit import SwarmUnit, COMMS_RANGE_M
 from sim.orbital import AU
+from sim.mesh import MeshNetwork
 
 try:
     from config import MIN_SAFE_DIST, MIN_ANGULAR_SEP
@@ -30,6 +31,7 @@ class Swarm:
         self.t       = 0.0
         self.metrics = []
         self._day    = 0
+        self.mesh    = MeshNetwork(self.units)  # autonomous mesh intelligence
 
     # ------------------------------------------------------------------
     # Initialization
@@ -51,22 +53,33 @@ class Swarm:
     def step(self, dt):
         alive = self.alive_units()
 
-        # Build comms-range-limited packet map:
-        # each unit only receives packets from neighbors it can hear
+        # Update mesh neighbor graph
+        self.mesh.update_neighbors(alive, COMMS_RANGE_M)
+
+        # Broadcast health packets (6-neighbor self-report)
+        self.mesh.broadcast_health(alive, self._day)
+
+        # Build comms-range-limited packet map
         all_packets = [u.state_packet() for u in alive]
 
         for unit in alive:
-            # Filter packets to only those within comms range
             visible = [
                 pkt for pkt in all_packets
                 if pkt['id'] != unit.uid and unit.can_hear(pkt['position'])
             ]
             unit.comms_isolated = (len(visible) == 0)
 
+            # Track shadow state before step for event logging
+            was_shadowed = getattr(unit, 'shadowed', False)
+
             unit.step(dt, day=self._day)
 
             self._apply_collision_avoidance(unit, visible)
             self._apply_shadow_avoidance(unit, visible)
+
+            # Log shadow avoidance events
+            if getattr(unit, 'shadowed', False) and not was_shadowed:
+                self.mesh.log_shadow_event(unit.uid, self._day)
 
         self._log_metrics()
         self.t    += dt
@@ -136,7 +149,11 @@ class Swarm:
     # ------------------------------------------------------------------
 
     def simulate_dropout(self, unit_id):
-        """Kill a unit, then automatically rebalance the remaining swarm."""
+        """Kill a unit, trigger mesh role switch, then auto-rebalance RAAN."""
+        # Mesh handles role switching BEFORE kill so it can read position
+        alive_before = self.alive_units()
+        self.mesh.handle_dropout(unit_id, alive_before, self._day)
+
         self.units[unit_id].kill()
         n_alive = len(self.alive_units())
         print(f"[t={self.t/86400:.1f}d] Unit {unit_id} dropped out. "
@@ -180,6 +197,8 @@ class Swarm:
         total_power_W  = sum(u.current_power_W for u in alive)
         avg_battery    = np.mean([u.battery_pct() for u in alive]) if alive else 0.0
         max_drift_km   = max((u.orbital_drift_km() for u in alive), default=0.0)
+        n_harvesters, n_relayers = self.mesh.role_counts(alive)
+        mesh_conn      = self.mesh.mesh_connectivity(alive)
 
         self.metrics.append({
             't':                    self.t,
@@ -193,6 +212,9 @@ class Swarm:
             'total_power_W':        total_power_W,
             'avg_battery_pct':      avg_battery,
             'max_drift_km':         max_drift_km,
+            'n_harvesters':         n_harvesters,
+            'n_relayers':           n_relayers,
+            'mesh_connectivity':    mesh_conn,
         })
 
     def _count_collision_violations(self, alive):

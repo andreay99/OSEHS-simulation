@@ -30,6 +30,7 @@ from mpl_toolkits.mplot3d import Axes3D          # noqa: F401
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 from sim.swarm import Swarm
+from sim.mesh import HARVESTER, RELAYER
 from sim.orbital import (AU, coe_to_eci, PANEL_AREA_M2,
                          PANEL_EFFICIENCY, solar_irradiance_at)
 from config import (
@@ -171,15 +172,22 @@ orbit_line, = ax3d.plot(xs, ys, zs, color='#4466ff', alpha=0.55,
 
 # Compact legend
 legend_data = [
-    ('#00ccff', '■ Active'),
+    ('#00ddff', '■ Harvester'),
+    ('#00ff88', '■ Relayer'),
     ('#ffaa00', '■ Shadowed'),
     ('#cc44ff', '■ Isolated'),
     ('#ff3333', '✕ Failed'),
+    ('#ffffff', '— Mesh link'),
 ]
 for idx, (col, lbl) in enumerate(legend_data):
-    ax3d.text2D(0.02, 0.13 - idx * 0.038, lbl,
-                color=col, fontsize=7, transform=ax3d.transAxes,
+    ax3d.text2D(0.02, 0.20 - idx * 0.038, lbl,
+                color=col, fontsize=6.5, transform=ax3d.transAxes,
                 fontfamily='monospace')
+
+# Event log text (bottom left of 3D view)
+event_text = ax3d.text2D(0.02, 0.01, '', color='#ffdd88', fontsize=6,
+                          transform=ax3d.transAxes, va='bottom',
+                          fontfamily='monospace')
 
 title_text = ax3d.set_title('', color='#ddddff', fontsize=9, pad=3)
 
@@ -261,9 +269,13 @@ def update(frame):
     avg_batt = np.mean([u.battery_pct() for u in alive]) if alive else 0
     tot_kw   = sum(u.current_power_W for u in alive) / 1000
 
+    h_count, r_count = swarm.mesh.role_counts(alive)
+    mesh_pct = swarm.mesh.mesh_connectivity(alive) * 100
+
     title_text.set_text(
         f'Day {frame:4d}  │  {len(alive)}/{N_UNITS} active  │  '
-        f'{tot_kw:.1f} kW  │  Batt {avg_batt:.0f}%'
+        f'{tot_kw:.1f} kW  │  Batt {avg_batt:.0f}%  │  '
+        f'H:{h_count} R:{r_count}  │  Mesh {mesh_pct:.0f}%'
         + (f'  │  ⚠ {n_shadow} shadowed' if n_shadow else '')
         + (f'  │  ⚠ {n_iso} isolated'    if n_iso    else '')
     )
@@ -282,34 +294,43 @@ def update(frame):
     ]:
         ax3d.scatter([0], [0], [0], s=s, color=c, alpha=a, zorder=10, depthshade=False)
 
-    # Separate units by state
-    pos_ok, pos_sh, pos_iso = [], [], []
+    # Draw mesh communication links first (behind units)
+    for (pa, pb) in swarm.mesh.mesh_lines:
+        xa, ya, za = pa[0]/AU, pa[1]/AU, pa[2]/AU
+        xb, yb, zb = pb[0]/AU, pb[1]/AU, pb[2]/AU
+        ax3d.plot([xa, xb], [ya, yb], [za, zb],
+                  color='#ffffff', alpha=0.08, linewidth=0.5,
+                  zorder=3, linestyle='--')
+
+    # Draw units colored by role + state
+    pos_harv, pos_relay, pos_sh, pos_iso = [], [], [], []
     for u in alive:
         p = u.position() / AU
         if getattr(u, 'shadowed', False):
             pos_sh.append(p)
         elif getattr(u, 'comms_isolated', False):
             pos_iso.append(p)
+        elif swarm.mesh.get_role(u.uid) == HARVESTER:
+            pos_harv.append(p)
         else:
-            pos_ok.append(p)
+            pos_relay.append(p)
 
     def _draw_units(positions, core_col, glow_col):
         if not positions:
             return
         pts = np.array(positions)
-        # Outer glow halo
         ax3d.scatter(pts[:,0], pts[:,1], pts[:,2],
                      s=PANEL_GLOW_SIZE, c=glow_col, alpha=0.25,
                      zorder=4, depthshade=False, linewidths=0)
-        # Bright core
         ax3d.scatter(pts[:,0], pts[:,1], pts[:,2],
                      s=PANEL_CORE_SIZE, c=core_col, alpha=0.95,
                      zorder=5, depthshade=False, linewidths=0,
-                     marker='h')   # 'h' = regular hexagon marker in matplotlib
+                     marker='h')
 
-    _draw_units(pos_ok,  '#00ddff', '#00aadd')
-    _draw_units(pos_sh,  '#ffbb00', '#dd8800')
-    _draw_units(pos_iso, '#dd55ff', '#aa22cc')
+    _draw_units(pos_harv,  '#00ddff', '#00aadd')   # cyan  = harvester
+    _draw_units(pos_relay, '#00ff88', '#00cc66')   # green = relayer
+    _draw_units(pos_sh,    '#ffbb00', '#dd8800')   # orange = shadowed
+    _draw_units(pos_iso,   '#dd55ff', '#aa22cc')   # purple = isolated
 
     dead = swarm.failed_units()
     if dead:
@@ -317,6 +338,11 @@ def update(frame):
         ax3d.scatter(pf[:,0], pf[:,1], pf[:,2],
                      c='#ff3333', s=140, marker='x', zorder=6,
                      linewidths=2.5, depthshade=False)
+
+    # Show last 3 autonomous events in event log
+    recent = swarm.mesh.events[-3:] if swarm.mesh.events else []
+    event_lines = [f"Day {e['day']:4d} [{e['type']}] {e['msg']}" for e in recent]
+    event_text.set_text('\n'.join(event_lines))
 
     # Perihelion / aphelion dots (persist after collection clear)
     ax3d.scatter([R_PERI], [0], [0], s=18, color='#ff6644', marker='D',
