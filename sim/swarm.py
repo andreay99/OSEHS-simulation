@@ -1,5 +1,5 @@
 import numpy as np
-from sim.unit import SwarmUnit
+from sim.unit import SwarmUnit, COMMS_RANGE_M
 from sim.orbital import AU
 
 try:
@@ -8,31 +8,35 @@ except ImportError:
     MIN_SAFE_DIST    = 0.005 * AU
     MIN_ANGULAR_SEP  = np.radians(10.0)
 
-RAAN_NUDGE       = np.radians(0.05)  # correction rate per step for shadow avoidance
-NU_NUDGE         = 0.001             # correction rate per step for collision avoidance
+RAAN_NUDGE = np.radians(0.05)   # RAAN correction per step for shadow avoidance
+NU_NUDGE   = 0.001              # true anomaly nudge for collision avoidance
 
 
 class Swarm:
     """
     OSEHS swarm in pearl-necklace formation.
 
-    Pearl necklace: all units share the same a, e, i, omega.
-    Each unit gets a unique RAAN so they orbit side-by-side
-    without constant fuel consumption (as directed by team lead).
+    Realistic Phase 3 upgrades:
+    - Comms-range-limited broadcast: units only share state with neighbors
+      within COMMS_RANGE_M — no magic global broadcast
+    - Battery-aware health reporting
+    - Orbital drift tracking per unit
+    - Power output in real watts
     """
 
     def __init__(self, n_units, a=AU, e=0.0, i=0.0, omega=0.0):
         self.n_units = n_units
-        self.units = self._init_pearl_necklace(n_units, a, e, i, omega)
-        self.t = 0.0
+        self.units   = self._init_pearl_necklace(n_units, a, e, i, omega)
+        self.t       = 0.0
         self.metrics = []
+        self._day    = 0
 
     # ------------------------------------------------------------------
     # Initialization
     # ------------------------------------------------------------------
 
     def _init_pearl_necklace(self, n, a, e, i, omega):
-        units = []
+        units     = []
         raan_step = 2.0 * np.pi / n
         for uid in range(n):
             raan = uid * raan_step
@@ -45,13 +49,28 @@ class Swarm:
     # ------------------------------------------------------------------
 
     def step(self, dt):
-        packets = self._broadcast()
-        for unit in self.alive_units():
-            unit.step(dt)
-            self._apply_collision_avoidance(unit, packets)
-            self._apply_shadow_avoidance(unit, packets)
+        alive = self.alive_units()
+
+        # Build comms-range-limited packet map:
+        # each unit only receives packets from neighbors it can hear
+        all_packets = [u.state_packet() for u in alive]
+
+        for unit in alive:
+            # Filter packets to only those within comms range
+            visible = [
+                pkt for pkt in all_packets
+                if pkt['id'] != unit.uid and unit.can_hear(pkt['position'])
+            ]
+            unit.comms_isolated = (len(visible) == 0)
+
+            unit.step(dt, day=self._day)
+
+            self._apply_collision_avoidance(unit, visible)
+            self._apply_shadow_avoidance(unit, visible)
+
         self._log_metrics()
-        self.t += dt
+        self.t    += dt
+        self._day += 1
 
     def _broadcast(self):
         return [u.state_packet() for u in self.alive_units()]
@@ -63,11 +82,11 @@ class Swarm:
     def _apply_collision_avoidance(self, unit, packets):
         """
         If two units come within MIN_SAFE_DIST, nudge true anomaly outward.
-        Prevents physical collision and mutual shadowing at close range.
+        Only runs if the other unit is within comms range.
         """
         pos = unit.position()
         for pkt in packets:
-            if pkt['id'] == unit.uid or not pkt['alive']:
+            if not pkt['alive']:
                 continue
             dist = np.linalg.norm(pos - pkt['position'])
             if dist < MIN_SAFE_DIST:
@@ -82,32 +101,25 @@ class Swarm:
 
     def _apply_shadow_avoidance(self, unit, packets):
         """
-        Check angular separation between this unit and every neighbor as
-        seen from the Sun (origin). If two panels are within MIN_ANGULAR_SEP,
-        one may block the other's solar exposure — autonomously correct by
-        nudging RAAN apart so the panels spread out in the pearl necklace.
-
-        This satisfies the 95% autonomous correction KPP without ground
-        intervention.
+        Check angular separation between this unit and visible neighbors.
+        If within MIN_ANGULAR_SEP, autonomously nudge RAAN to spread out.
         """
-        r_self = unit.position()
+        r_self     = unit.position()
         r_self_hat = r_self / np.linalg.norm(r_self)
         unit.shadowed = False
 
         for pkt in packets:
-            if pkt['id'] == unit.uid or not pkt['alive']:
+            if not pkt['alive']:
                 continue
-            r_other = pkt['position']
+            r_other     = pkt['position']
             r_other_hat = r_other / np.linalg.norm(r_other)
 
             cos_ang = np.clip(np.dot(r_self_hat, r_other_hat), -1.0, 1.0)
-            angle = np.arccos(cos_ang)
+            angle   = np.arccos(cos_ang)
 
             if angle < MIN_ANGULAR_SEP:
                 unit.shadowed = True
-                # Determine which direction to nudge RAAN so panels spread apart
                 raan_diff = unit.raan - pkt['raan']
-                # Normalise to [-pi, pi]
                 raan_diff = (raan_diff + np.pi) % (2.0 * np.pi) - np.pi
                 if raan_diff >= 0:
                     unit.raan = (unit.raan + RAAN_NUDGE) % (2.0 * np.pi)
@@ -115,7 +127,6 @@ class Swarm:
                     unit.raan = (unit.raan - RAAN_NUDGE) % (2.0 * np.pi)
 
     def _angular_sep(self, r_a, r_b):
-        """Angular separation between two position vectors as seen from Sun."""
         a_hat = r_a / np.linalg.norm(r_a)
         b_hat = r_b / np.linalg.norm(r_b)
         return np.arccos(np.clip(np.dot(a_hat, b_hat), -1.0, 1.0))
@@ -135,12 +146,11 @@ class Swarm:
 
     def rebalance_raan(self):
         """
-        Redistribute RAAN evenly across surviving units to close coverage
-        gaps left by failed panels. Called automatically on every dropout
-        so no ground intervention is needed (95% autonomous KPP).
+        Redistribute RAAN evenly across surviving units.
+        Called automatically on every dropout — no ground command needed.
         """
-        alive = self.alive_units()
-        n = len(alive)
+        alive     = self.alive_units()
+        n         = len(alive)
         if n == 0:
             return
         raan_step = 2.0 * np.pi / n
@@ -148,24 +158,28 @@ class Swarm:
             unit.raan = idx * raan_step
 
     # ------------------------------------------------------------------
-    # Metrics logging (KPPs from proposal)
+    # Metrics logging
     # ------------------------------------------------------------------
 
     def _log_metrics(self):
-        alive = self.alive_units()
+        alive  = self.alive_units()
         n_alive = len(alive)
 
         collision_violations = self._count_collision_violations(alive)
         shadow_violations    = sum(1 for u in alive if getattr(u, 'shadowed', False))
+        comms_isolated       = sum(1 for u in alive if getattr(u, 'comms_isolated', False))
 
         raans = sorted(u.raan for u in alive)
         if len(raans) > 1:
-            gaps = np.diff(raans + [raans[0] + 2.0 * np.pi])
+            gaps        = np.diff(raans + [raans[0] + 2.0 * np.pi])
             spacing_std = float(np.std(gaps))
         else:
             spacing_std = 0.0
 
-        total_energy = sum(u.energy_collected for u in alive)
+        total_energy   = sum(u.energy_collected for u in alive)
+        total_power_W  = sum(u.current_power_W for u in alive)
+        avg_battery    = np.mean([u.battery_pct() for u in alive]) if alive else 0.0
+        max_drift_km   = max((u.orbital_drift_km() for u in alive), default=0.0)
 
         self.metrics.append({
             't':                    self.t,
@@ -173,8 +187,12 @@ class Swarm:
             'pct_functional':       100.0 * n_alive / self.n_units,
             'collision_violations': collision_violations,
             'shadow_violations':    shadow_violations,
+            'comms_isolated':       comms_isolated,
             'spacing_std_rad':      spacing_std,
             'total_energy_Ws':      total_energy,
+            'total_power_W':        total_power_W,
+            'avg_battery_pct':      avg_battery,
+            'max_drift_km':         max_drift_km,
         })
 
     def _count_collision_violations(self, alive):
