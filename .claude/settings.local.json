@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c ' *)",
+      "Bash(pip3 install *)",
+      "Bash(python3 -)",
+      "Bash(python3 main.py)",
+      "Bash(kill %1)"
+    ]
+  }
+}
