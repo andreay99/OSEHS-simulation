@@ -37,6 +37,8 @@ All parameters updated with real orbital dynamics data from KesUraNu (Ranu Baylo
 - **Shadow avoidance** — autonomous RAAN nudge if angular separation < 10°. No ground command needed
 - **Collision avoidance** — true anomaly nudge if unit spacing < 750,000 km
 - **Auto-rebalance on dropout** — RAAN redistributed evenly among surviving units automatically
+- **Autonomous mesh rerouting** — 6 harvesters + 6 relayers; if a harvester fails the nearest relayer autonomously switches role to maintain energy output. Mesh re-routes around failed relayers with no ground command
+- **6-neighbor health packets** — each unit broadcasts self-report (battery %, power output, drift, shadow status) to up to 6 nearest neighbors every timestep
 
 ## Power Output
 
